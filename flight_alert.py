@@ -135,6 +135,8 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
     history = load_history(data_dir)
 
     rows = list(fetch_all(token, cfg)) if rows is None else rows
+    if not rows:
+        raise SystemExit("no rows fetched (token invalid or API down)")
     changed = [r for r in rows if last.get(key(r)) != r["price"]]
     ow_min = {}
     for r in rows:
@@ -161,9 +163,12 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
 
     if alerts:
         if webhook:
-            notify(webhook, [a[:3] for a in alerts])
-            for r, _, _, ak in alerts:
-                alerted[ak] = r["price"]
+            try:
+                notify(webhook, [a[:3] for a in alerts])
+                for r, _, _, ak in alerts:
+                    alerted[ak] = r["price"]
+            except OSError as e:  # keep collecting data even if Discord is down
+                print("notify failed:", type(e).__name__, e)
         else:
             for r, j, _, _ in alerts:
                 print("ALERT", r["o_ap"], r["d_ap"], r["dep_at"][:10], r["price"], f"-{j['drop']:.0%}")

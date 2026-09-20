@@ -21,4 +21,4 @@ jobs:
       - run: |
           git config user.name "fare-bot" && git config user.email "fare-bot@users.noreply.github.com"
           git add data/
-          git diff --staged --quiet || (git commit -m "update prices" && git push)
+          git diff --staged --quiet || (git commit -m "update prices" && git pull --rebase && git push)
