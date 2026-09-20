@@ -66,5 +66,26 @@ class WarmupTest(unittest.TestCase):
             self.assertEqual(fa.run(CFG, "t", None, d, rows=[row(50000, dep=future, airline="A0")]), [])
 
 
+class WarmupNoticeTest(unittest.TestCase):
+    def test_notice_sent_once_after_warmup(self):
+        sent = []
+        orig, fa.post = fa.post, lambda w, p: sent.append(p)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                fa.run(CFG, "t", None, d, rows=[row(150000)])           # first obs, now
+                fa.run(CFG, "t", "http://x", d, rows=[row(150000)])     # still warming up
+                self.assertEqual(sent, [])
+                old = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat(timespec="seconds")
+                p = f"{d}/obs-2000-01.csv"
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write("ts,kind,o_ap,d_ap,dep_at,ret_at,airline,price\n"
+                            f"{old},ow,ICN,NRT,2026-12-01T08:00:00+09:00,,7C,150000\n")
+                fa.run(CFG, "t", "http://x", d, rows=[row(150000)])
+                fa.run(CFG, "t", "http://x", d, rows=[row(150000)])
+                self.assertEqual(len(sent), 1)
+        finally:
+            fa.post = orig
+
+
 if __name__ == "__main__":
     unittest.main()

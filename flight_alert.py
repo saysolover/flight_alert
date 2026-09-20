@@ -106,6 +106,12 @@ def judge(row, history, cfg, now):
     return {"median": median, "samples": len(prices), "drop": 1 - row["price"] / median}
 
 
+def post(webhook, payload):
+    req = urllib.request.Request(webhook, json.dumps(payload).encode(),
+                                 {"Content-Type": "application/json", "User-Agent": "flight-alert"})
+    urllib.request.urlopen(req, timeout=30).close()
+
+
 def notify(webhook, alerts):
     embeds = []
     for r, j, extra in alerts:
@@ -121,9 +127,17 @@ def notify(webhook, alerts):
             embed["url"] = "https://www.aviasales.com" + r["link"]
         embeds.append(embed)
     for i in range(0, len(embeds), 10):
-        body = json.dumps({"embeds": embeds[i:i + 10]}).encode()
-        req = urllib.request.Request(webhook, body, {"Content-Type": "application/json", "User-Agent": "flight-alert"})
-        urllib.request.urlopen(req, timeout=30).close()
+        post(webhook, {"embeds": embeds[i:i + 10]})
+
+
+def warmup_notice(webhook, history, min_samples):
+    series = {}
+    for h in history:
+        k = (h["kind"], h["o_ap"], h["d_ap"])
+        series[k] = series.get(k, 0) + 1
+    ready = sum(1 for n in series.values() if n >= min_samples)
+    post(webhook, {"content": f"학습 기간이 끝났습니다. 지금부터 유의하게 낮은 가격이 나오면 알림을 보냅니다.\n"
+                              f"누적 관측 {len(history):,}건, 노선 시리즈 {len(series)}개 중 {ready}개가 표본 {min_samples}건 이상입니다."})
 
 
 def run(cfg, token, webhook, data_dir="data", rows=None):
@@ -158,6 +172,12 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
                 if out and back:
                     extra["ow_sum"] = out + back
             alerts.append((r, j, extra, ak))
+    if warm and webhook and "_warmup_notice" not in alerted:
+        try:
+            warmup_notice(webhook, history, cfg["alert"]["min_samples"])
+            alerted["_warmup_notice"] = 1
+        except OSError as e:
+            print("warmup notice failed:", type(e).__name__, e)
     alerts.sort(key=lambda a: -a[1]["drop"])
     alerts = alerts[:cfg["alert"]["max_alerts_per_run"]]
 
