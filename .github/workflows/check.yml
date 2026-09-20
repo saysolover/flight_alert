@@ -3,6 +3,11 @@ on:
   schedule:
     - cron: "17 */2 * * *"   # every 2 hours (UTC)
   workflow_dispatch:
+    inputs:
+      test:
+        description: "Send a Discord test message only"
+        type: boolean
+        default: false
 permissions:
   contents: write
 concurrency: fare-check
@@ -14,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: python flight_alert.py
+      - run: python flight_alert.py ${{ inputs.test && '--test' || '' }}
         env:
           TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}

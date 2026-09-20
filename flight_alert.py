@@ -1,5 +1,5 @@
 """Collect Travelpayouts cached fares, store price changes, alert Discord on significant lows."""
-import csv, glob, json, os, time, tomllib, urllib.error, urllib.parse, urllib.request
+import csv, glob, json, os, sys, time, tomllib, urllib.error, urllib.parse, urllib.request
 from datetime import date, datetime, timedelta, timezone
 
 API = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
@@ -195,4 +195,10 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
 if __name__ == "__main__":
     with open("config.toml", "rb") as f:
         cfg = tomllib.load(f)
+    if "--test" in sys.argv:  # connectivity check only, no data touched
+        r = {"kind": "ow", "o_ap": "ICN", "d_ap": "NRT", "dep_at": "2026-12-01T09:00:00+09:00", "ret_at": "",
+             "airline": "TEST", "price": 100000, "gate": "test", "link": ""}
+        notify(os.environ["DISCORD_WEBHOOK"], [(r, {"median": 150000, "samples": 0, "drop": 0.33}, {})])
+        print("test message sent")
+        sys.exit(0)
     run(cfg, os.environ["TRAVELPAYOUTS_TOKEN"], os.environ.get("DISCORD_WEBHOOK"))
