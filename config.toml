@@ -1,0 +1,18 @@
+[search]
+origins = ["ICN", "GMP"]
+# Japan cities with direct-flight data (found 2026-09-20). Minor cities have very sparse data.
+cities = ["TYO", "OSA", "FUK", "OKA", "NGO", "SPK", "HIJ", "FSZ", "SDJ", "KOJ", "KMQ", "MYJ", "KIJ", "KMJ", "NGS", "KMI", "TAK", "YGJ", "SHI", "KKJ", "AOJ", "ISG"]
+horizon_days = 180
+currency = "krw"
+airlines_exclude = []   # e.g. ["MM", "ZG"]
+
+[alert]
+warmup_days = 7        # learn-only period after the first observation
+lookback_days = 60
+percentile = 10        # price must be at or below this percentile of history
+min_drop = 0.15        # and at least this far below the median
+min_samples = 20       # per (series, days-to-departure bucket); below this we only learn
+realert_drop = 0.05    # re-alert same flight only if this much cheaper than last alert
+buckets = [30, 90]     # days-to-departure buckets: <=30, 31-90, >90
+max_price = 0          # 0 = off
+max_alerts_per_run = 10
