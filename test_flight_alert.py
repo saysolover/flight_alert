@@ -154,10 +154,47 @@ class SummaryTest(unittest.TestCase):
             a = fa.read_json(f"{d}/summary.json")["airports"]["NRT"]
             self.assertIn("lcc", a["ow_out_by_class"])
 
-    def test_omits_airport_without_rt_or_enough_samples(self):
+    def test_sufficient_airport_has_no_sparse_key(self):
+        a = fa.build_summary(self.rows(), self.ORIGINS, NOW)["airports"]["NRT"]
+        self.assertNotIn("sparse", a)
+        self.assertEqual(set(a), {"ow_out", "rt", "median_ow_out", "samples", "ow_back"})
+
+    def test_airport_without_rt_is_kept_as_sparse(self):
         no_rt = [r for r in self.rows() if r["kind"] != "rt"]
-        self.assertEqual(fa.build_summary(no_rt, self.ORIGINS, NOW)["airports"], {})
-        self.assertEqual(fa.build_summary(self.rows(n=10), self.ORIGINS, NOW)["airports"], {})
+        a = fa.build_summary(no_rt, self.ORIGINS, NOW, classes=self.CLASSES)["airports"]["NRT"]
+        self.assertTrue(a["sparse"])
+        self.assertEqual(a["ow_out"]["price"], 71000)
+        self.assertNotIn("rt", a)
+        self.assertNotIn("rt_by_class", a)
+        self.assertIn("ow_out_by_class", a)
+
+    def test_low_sample_airport_is_kept_as_sparse(self):
+        rows = [frow("ow", "ICN", "CTS", 90000 + i, dep=f"2026-12-{1 + i:02d}") for i in range(5)]
+        rows.append(frow("rt", "ICN", "CTS", 200000, ret="2026-12-09"))
+        a = fa.build_summary(rows, self.ORIGINS, NOW)["airports"]["CTS"]
+        self.assertEqual((a["sparse"], a["samples"], a["rt"]["price"]), (True, 5, 200000))
+
+    def test_rt_only_airport_and_back_only_airport(self):
+        rows = [frow("rt", "ICN", "SDJ", 250000, ret="2026-12-09"), frow("ow", "KIJ", "ICN", 90000, dep="2026-12-09")]
+        s = fa.build_summary(rows, self.ORIGINS, NOW, classes=self.CLASSES)["airports"]
+        self.assertEqual(set(s), {"SDJ"})                                      # back-only airport not listed
+        self.assertTrue(s["SDJ"]["sparse"])
+        self.assertNotIn("ow_out", s["SDJ"])
+        self.assertEqual(s["SDJ"]["samples"], 0)
+
+    def test_existing_fields_unchanged_by_extra_sparse_airports(self):
+        base = fa.build_summary(self.rows(), self.ORIGINS, NOW, classes=self.CLASSES)["airports"]
+        extra = self.rows() + [frow("ow", "ICN", "HIJ", 80000)]
+        both = fa.build_summary(extra, self.ORIGINS, NOW, classes=self.CLASSES)["airports"]
+        self.assertEqual(both["NRT"], base["NRT"])
+        self.assertTrue(both["HIJ"]["sparse"])
+
+    def test_dates_uses_same_airport_set(self):
+        rows = self.rows() + [frow("ow", "ICN", "HIJ", 80000, dep="2026-12-04")]
+        s = fa.build_summary(rows, self.ORIGINS, NOW, classes=self.CLASSES)
+        d = fa.build_dates(rows, self.ORIGINS, NOW, self.CLASSES, set(s["airports"]))
+        self.assertEqual(set(d["airports"]), set(s["airports"]))
+        self.assertIn("2026-12-04", d["airports"]["HIJ"]["out"])
 
     def test_run_writes_summary_file(self):
         with tempfile.TemporaryDirectory() as d:

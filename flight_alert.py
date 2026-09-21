@@ -172,22 +172,28 @@ def build_summary(rows, origins, now, min_samples=30, back_min_days=7, classes=N
     airports = {}
     for a, g in groups.items():
         out, rt, back = g.get("ow_out", []), g.get("rt_out", []), g.get("ow_back", [])
-        if len(out) < min_samples or not rt:
+        if not out and not rt:
             continue
-        airports[a] = {
-            "ow_out": ow_entry(cheapest(out)),
-            "rt": rt_entry(cheapest(rt)),
-            "median_ow_out": int(statistics.median(r["price"] for r in out)),
-            "samples": len(out),
-        }
+        airports[a] = {}
+        if out:
+            airports[a]["ow_out"] = ow_entry(cheapest(out))
+        if rt:
+            airports[a]["rt"] = rt_entry(cheapest(rt))
+        if out:
+            airports[a]["median_ow_out"] = int(statistics.median(r["price"] for r in out))
+        airports[a]["samples"] = len(out)
+        if len(out) < min_samples or not rt:
+            airports[a]["sparse"] = True  # thin data: the web app shows these separately
         back = [r for r in back if r["dep_at"][:10] >= earliest]  # skip imminent departures
         if back:
             b = cheapest(back)
             airports[a]["ow_back"] = {"price": b["price"], "dest": b["d_ap"], "date": b["dep_at"][:10],
                                       "airline": b["airline"]}
         if classes:
-            airports[a]["rt_by_class"] = by_class(rt, rt_entry)
-            airports[a]["ow_out_by_class"] = by_class(out, ow_entry)
+            if rt:
+                airports[a]["rt_by_class"] = by_class(rt, rt_entry)
+            if out:
+                airports[a]["ow_out_by_class"] = by_class(out, ow_entry)
     return {"updated": now.isoformat(timespec="seconds"), "source": "Travelpayouts 캐시 (참고가)",
             "airports": airports}
 
