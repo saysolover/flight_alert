@@ -49,9 +49,9 @@ def read_json(path):
         return json.load(f)
 
 
-def write_json(path, obj):
+def write_json(path, obj, **kw):
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False)
+        json.dump(obj, f, ensure_ascii=False, **kw)
 
 
 def key(r):
@@ -192,6 +192,31 @@ def build_summary(rows, origins, now, min_samples=30, back_min_days=7, classes=N
             "airports": airports}
 
 
+def build_dates(rows, origins, now, classes, airports):
+    """Cheapest fare per airport/date/class for the web app's date calculator (contract: A2-SPEC S3)."""
+    cls_of = {code: c for c, codes in classes.items() for code in codes}
+    today = now.date().isoformat()
+    out = {a: {"out": {}, "back": {}, "rt": {}} for a in airports}
+
+    def put(a, section, k, r, kr_ap):
+        c = cls_of.get(r["airline"])
+        if c is None or a not in out or r["dep_at"][:10] < today:
+            return  # unclassified, non-target airport, or already departed
+        slot = out[a][section].setdefault(k, {})
+        if c not in slot or r["price"] < slot[c][0]:
+            slot[c] = [r["price"], kr_ap, r["airline"]]
+
+    for r in rows:
+        dep = r["dep_at"][:10]
+        if r["kind"] == "rt" and r["o_ap"] in origins:
+            put(r["d_ap"], "rt", dep + "|" + r["ret_at"][:10], r, r["o_ap"])
+        elif r["kind"] == "ow" and r["o_ap"] in origins:
+            put(r["d_ap"], "out", dep, r, r["o_ap"])
+        elif r["kind"] == "ow" and r["d_ap"] in origins:
+            put(r["o_ap"], "back", dep, r, r["d_ap"])
+    return {"updated": now.isoformat(timespec="seconds"), "airports": out}
+
+
 def run(cfg, token, webhook, data_dir="data", rows=None):
     now = datetime.now(timezone.utc)
     os.makedirs(data_dir, exist_ok=True)
@@ -260,7 +285,11 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
     last = {k: v for k, v in last.items() if k.split("|")[3][:10] >= today}
     write_json(last_p, last)
     write_json(alerted_p, alerted)
-    write_json(os.path.join(data_dir, "summary.json"), build_summary(rows, cfg["search"]["origins"], now, classes=cfg.get("classes")))
+    origins, classes = cfg["search"]["origins"], cfg.get("classes")
+    summary = build_summary(rows, origins, now, classes=classes)
+    write_json(os.path.join(data_dir, "summary.json"), summary)
+    write_json(os.path.join(data_dir, "dates.json"),
+               build_dates(rows, origins, now, classes or {}, set(summary["airports"])), separators=(",", ":"))
     print(f"fetched={len(rows)} changed={len(changed)} alerts={len(alerts)}")
     return alerts
 

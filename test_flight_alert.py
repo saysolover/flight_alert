@@ -167,5 +167,52 @@ class SummaryTest(unittest.TestCase):
             self.assertIn("참고가", s["source"])
 
 
+class DatesTest(unittest.TestCase):
+    ORIGINS = ["ICN", "GMP"]
+    CLASSES = {"fsc": ["KE", "OZ"], "hsc": ["YP"], "lcc": ["7C", "MM"]}
+    AIRPORTS = {"NRT"}
+
+    def build(self, rows):
+        return fa.build_dates(rows, self.ORIGINS, NOW, self.CLASSES, self.AIRPORTS)["airports"]["NRT"]
+
+    def test_out_keeps_cheapest_per_date_and_class(self):
+        a = self.build([frow("ow", "ICN", "NRT", 90000, airline="MM"), frow("ow", "GMP", "NRT", 80000, airline="7C"),
+                        frow("ow", "ICN", "NRT", 170000, airline="KE"), frow("ow", "GMP", "NRT", 160000, airline="OZ")])
+        self.assertEqual(a["out"]["2026-12-03"], {"lcc": [80000, "GMP", "7C"], "fsc": [160000, "GMP", "OZ"]})
+
+    def test_unclassified_excluded(self):
+        a = self.build([frow("ow", "ICN", "NRT", 10000, airline="H1"), frow("ow", "ICN", "NRT", 20000, airline="ET"),
+                        frow("rt", "ICN", "NRT", 30000, ret="2026-12-08", airline="H1")])
+        self.assertEqual((a["out"], a["rt"]), ({}, {}))
+
+    def test_past_departures_excluded(self):
+        a = self.build([frow("ow", "ICN", "NRT", 50000, dep="2026-09-19"),
+                        frow("ow", "ICN", "NRT", 60000, dep="2026-09-20")])          # today is included
+        self.assertEqual(list(a["out"]), ["2026-09-20"])
+
+    def test_rt_key_format(self):
+        a = self.build([frow("rt", "ICN", "NRT", 222198, ret="2026-12-08")])
+        self.assertEqual(a["rt"], {"2026-12-03|2026-12-08": {"lcc": [222198, "ICN", "MM"]}})
+
+    def test_back_direction(self):
+        a = self.build([frow("ow", "NRT", "ICN", 104923, dep="2026-12-08", airline="MM"),
+                        frow("ow", "NRT", "GMP", 99000, dep="2026-12-08", airline="7C")])
+        self.assertEqual(a["back"], {"2026-12-08": {"lcc": [99000, "GMP", "7C"]}})
+        self.assertEqual(a["out"], {})
+
+    def test_non_target_airport_excluded(self):
+        d = fa.build_dates([frow("ow", "ICN", "KIX", 70000)], self.ORIGINS, NOW, self.CLASSES, self.AIRPORTS)
+        self.assertEqual(list(d["airports"]), ["NRT"])
+        self.assertEqual(d["airports"]["NRT"]["out"], {})
+
+    def test_run_writes_compact_dates_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            fa.run(CFG, "t", None, d, rows=SummaryTest().rows())
+            with open(f"{d}/dates.json", encoding="utf-8") as f:
+                raw = f.read()
+            self.assertNotIn(" ", raw)
+            self.assertIn("2026-12-03", fa.read_json(f"{d}/dates.json")["airports"]["NRT"]["out"])
+
+
 if __name__ == "__main__":
     unittest.main()
