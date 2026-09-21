@@ -6,6 +6,12 @@ horizon_days = 180
 currency = "krw"
 airlines_exclude = []   # e.g. ["MM", "ZG"]
 
+# Airline classes for summary.json; unlisted codes (H1, ET, ...) only count toward the overall cheapest.
+[classes]
+fsc = ["KE", "OZ", "JL", "NH"]
+hsc = ["YP", "WE"]
+lcc = ["7C", "LJ", "TW", "ZE", "BX", "RS", "MM", "ZG"]
+
 [alert]
 warmup_days = 7        # learn-only period after the first observation
 lookback_days = 60

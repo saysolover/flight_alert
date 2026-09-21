@@ -140,33 +140,54 @@ def warmup_notice(webhook, history, min_samples):
                               f"누적 관측 {len(history):,}건, 노선 시리즈 {len(series)}개 중 {ready}개가 표본 {min_samples}건 이상입니다."})
 
 
-def build_summary(rows, origins, now, min_samples=30, back_min_days=7):
+def build_summary(rows, origins, now, min_samples=30, back_min_days=7, classes=None):
     """Cheapest fares per Japanese arrival airport (ICN+GMP merged) for the map web app."""
+    classes = classes or {}
     groups = {}
     for r in rows:
         if r["o_ap"] in origins:
             groups.setdefault(r["d_ap"], {}).setdefault(r["kind"] + "_out", []).append(r)
         elif r["kind"] == "ow" and r["d_ap"] in origins:
             groups.setdefault(r["o_ap"], {}).setdefault("ow_back", []).append(r)
+
+    def cheapest(rs):
+        return min(rs, key=lambda r: r["price"])
+
+    def ow_entry(r):
+        return {"price": r["price"], "origin": r["o_ap"], "date": r["dep_at"][:10], "airline": r["airline"]}
+
+    def rt_entry(r):
+        return {"price": r["price"], "origin": r["o_ap"], "dep": r["dep_at"][:10], "ret": r["ret_at"][:10],
+                "airline": r["airline"]}
+
+    def by_class(rs, entry):  # classes with no fares are omitted
+        out = {}
+        for c, codes in classes.items():
+            cr = [r for r in rs if r["airline"] in codes]
+            if cr:
+                out[c] = entry(cheapest(cr))
+        return out
+
+    earliest = (now.date() + timedelta(days=back_min_days)).isoformat()
     airports = {}
     for a, g in groups.items():
         out, rt, back = g.get("ow_out", []), g.get("rt_out", []), g.get("ow_back", [])
         if len(out) < min_samples or not rt:
             continue
-        o, t = min(out, key=lambda r: r["price"]), min(rt, key=lambda r: r["price"])
         airports[a] = {
-            "ow_out": {"price": o["price"], "origin": o["o_ap"], "date": o["dep_at"][:10], "airline": o["airline"]},
-            "rt": {"price": t["price"], "origin": t["o_ap"], "dep": t["dep_at"][:10], "ret": t["ret_at"][:10],
-                   "airline": t["airline"]},
+            "ow_out": ow_entry(cheapest(out)),
+            "rt": rt_entry(cheapest(rt)),
             "median_ow_out": int(statistics.median(r["price"] for r in out)),
             "samples": len(out),
         }
-        earliest = (now.date() + timedelta(days=back_min_days)).isoformat()
         back = [r for r in back if r["dep_at"][:10] >= earliest]  # skip imminent departures
         if back:
-            b = min(back, key=lambda r: r["price"])
+            b = cheapest(back)
             airports[a]["ow_back"] = {"price": b["price"], "dest": b["d_ap"], "date": b["dep_at"][:10],
                                       "airline": b["airline"]}
+        if classes:
+            airports[a]["rt_by_class"] = by_class(rt, rt_entry)
+            airports[a]["ow_out_by_class"] = by_class(out, ow_entry)
     return {"updated": now.isoformat(timespec="seconds"), "source": "Travelpayouts 캐시 (참고가)",
             "airports": airports}
 
@@ -239,7 +260,7 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
     last = {k: v for k, v in last.items() if k.split("|")[3][:10] >= today}
     write_json(last_p, last)
     write_json(alerted_p, alerted)
-    write_json(os.path.join(data_dir, "summary.json"), build_summary(rows, cfg["search"]["origins"], now))
+    write_json(os.path.join(data_dir, "summary.json"), build_summary(rows, cfg["search"]["origins"], now, classes=cfg.get("classes")))
     print(f"fetched={len(rows)} changed={len(changed)} alerts={len(alerts)}")
     return alerts
 

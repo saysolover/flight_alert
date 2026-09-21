@@ -124,6 +124,36 @@ class SummaryTest(unittest.TestCase):
         self.assertNotIn("ow_back", a)
         self.assertIn("ow_out", a)
 
+    CLASSES = {"fsc": ["KE", "OZ", "JL", "NH"], "hsc": ["YP", "WE"], "lcc": ["7C", "MM"]}
+
+    def test_class_breakdown_keeps_existing_fields(self):
+        rows = self.rows() + [frow("ow", "ICN", "NRT", 120000, airline="KE"),
+                              frow("rt", "ICN", "NRT", 300000, ret="2026-12-09", airline="KE"),
+                              frow("ow", "ICN", "NRT", 10000, airline="H1"),   # unclassified: overall only
+                              frow("rt", "ICN", "NRT", 20000, ret="2026-12-09", airline="ET")]
+        plain = fa.build_summary(rows, self.ORIGINS, NOW)["airports"]["NRT"]
+        a = fa.build_summary(rows, self.ORIGINS, NOW, classes=self.CLASSES)["airports"]["NRT"]
+        self.assertEqual(a["ow_out"], plain["ow_out"])                      # overall still counts H1
+        self.assertEqual(a["ow_out"]["price"], 10000)
+        self.assertEqual(a["rt"]["price"], 20000)
+        self.assertEqual(a["ow_out_by_class"]["fsc"]["price"], 120000)
+        self.assertEqual(a["ow_out_by_class"]["lcc"]["price"], 71000)
+        self.assertEqual(a["rt_by_class"]["fsc"]["price"], 300000)
+        self.assertEqual(a["rt_by_class"]["lcc"]["price"], 140000)
+        self.assertNotIn("hsc", a["ow_out_by_class"])                       # no HSC fares -> key omitted
+        self.assertNotIn("hsc", a["rt_by_class"])
+        self.assertNotIn("H1", str(a["ow_out_by_class"]) + str(a["rt_by_class"]))
+
+    def test_no_class_fields_without_config(self):
+        a = fa.build_summary(self.rows(), self.ORIGINS, NOW)["airports"]["NRT"]
+        self.assertNotIn("rt_by_class", a)
+
+    def test_run_uses_config_classes(self):
+        with tempfile.TemporaryDirectory() as d:
+            fa.run(CFG, "t", None, d, rows=self.rows())
+            a = fa.read_json(f"{d}/summary.json")["airports"]["NRT"]
+            self.assertIn("lcc", a["ow_out_by_class"])
+
     def test_omits_airport_without_rt_or_enough_samples(self):
         no_rt = [r for r in self.rows() if r["kind"] != "rt"]
         self.assertEqual(fa.build_summary(no_rt, self.ORIGINS, NOW)["airports"], {})
