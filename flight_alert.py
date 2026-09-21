@@ -1,5 +1,5 @@
 """Collect Travelpayouts cached fares, store price changes, alert Discord on significant lows."""
-import csv, glob, json, os, sys, time, tomllib, urllib.error, urllib.parse, urllib.request
+import csv, glob, json, os, statistics, sys, time, tomllib, urllib.error, urllib.parse, urllib.request
 from datetime import date, datetime, timedelta, timezone
 
 API = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
@@ -51,7 +51,7 @@ def read_json(path):
 
 def write_json(path, obj):
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f)
+        json.dump(obj, f, ensure_ascii=False)
 
 
 def key(r):
@@ -140,6 +140,37 @@ def warmup_notice(webhook, history, min_samples):
                               f"누적 관측 {len(history):,}건, 노선 시리즈 {len(series)}개 중 {ready}개가 표본 {min_samples}건 이상입니다."})
 
 
+def build_summary(rows, origins, now, min_samples=30, back_min_days=7):
+    """Cheapest fares per Japanese arrival airport (ICN+GMP merged) for the map web app."""
+    groups = {}
+    for r in rows:
+        if r["o_ap"] in origins:
+            groups.setdefault(r["d_ap"], {}).setdefault(r["kind"] + "_out", []).append(r)
+        elif r["kind"] == "ow" and r["d_ap"] in origins:
+            groups.setdefault(r["o_ap"], {}).setdefault("ow_back", []).append(r)
+    airports = {}
+    for a, g in groups.items():
+        out, rt, back = g.get("ow_out", []), g.get("rt_out", []), g.get("ow_back", [])
+        if len(out) < min_samples or not rt:
+            continue
+        o, t = min(out, key=lambda r: r["price"]), min(rt, key=lambda r: r["price"])
+        airports[a] = {
+            "ow_out": {"price": o["price"], "origin": o["o_ap"], "date": o["dep_at"][:10], "airline": o["airline"]},
+            "rt": {"price": t["price"], "origin": t["o_ap"], "dep": t["dep_at"][:10], "ret": t["ret_at"][:10],
+                   "airline": t["airline"]},
+            "median_ow_out": int(statistics.median(r["price"] for r in out)),
+            "samples": len(out),
+        }
+        earliest = (now.date() + timedelta(days=back_min_days)).isoformat()
+        back = [r for r in back if r["dep_at"][:10] >= earliest]  # skip imminent departures
+        if back:
+            b = min(back, key=lambda r: r["price"])
+            airports[a]["ow_back"] = {"price": b["price"], "dest": b["d_ap"], "date": b["dep_at"][:10],
+                                      "airline": b["airline"]}
+    return {"updated": now.isoformat(timespec="seconds"), "source": "Travelpayouts 캐시 (참고가)",
+            "airports": airports}
+
+
 def run(cfg, token, webhook, data_dir="data", rows=None):
     now = datetime.now(timezone.utc)
     os.makedirs(data_dir, exist_ok=True)
@@ -208,6 +239,7 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
     last = {k: v for k, v in last.items() if k.split("|")[3][:10] >= today}
     write_json(last_p, last)
     write_json(alerted_p, alerted)
+    write_json(os.path.join(data_dir, "summary.json"), build_summary(rows, cfg["search"]["origins"], now))
     print(f"fetched={len(rows)} changed={len(changed)} alerts={len(alerts)}")
     return alerts
 
