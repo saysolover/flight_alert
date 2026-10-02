@@ -251,5 +251,42 @@ class DatesTest(unittest.TestCase):
             self.assertIn("2026-12-03", fa.read_json(f"{d}/dates.json")["airports"]["NRT"]["out"])
 
 
+class QuotaTest(unittest.TestCase):
+    TODAY = NOW.date()
+
+    def cand(self, days, drop):
+        dep = (self.TODAY + timedelta(days=days)).isoformat()
+        return (frow("ow", "ICN", "NRT", 1, dep=dep), {"drop": drop}, {}, f"{days}-{drop}")
+
+    def split(self, sel):
+        n = [0, 0, 0]
+        for r, *_ in sel:
+            d = (datetime.fromisoformat(r["dep_at"][:10]).date() - self.TODAY).days
+            n[fa.bucket(d, CFG["alert"]["buckets"])] += 1
+        return n
+
+    def test_exact_quota_when_all_buckets_overflow(self):
+        c = [self.cand(5, 0.9 - i / 100) for i in range(8)] + [self.cand(60, 0.5 - i / 100) for i in range(8)]             + [self.cand(120, 0.3 - i / 100) for i in range(8)]
+        self.assertEqual(self.split(fa.select_alerts(c, CFG, self.TODAY)), [3, 4, 3])
+
+    def test_unused_slots_spill_over_keeping_total(self):
+        c = [self.cand(5, 0.9 - i / 100) for i in range(8)] + [self.cand(60, 0.5 - i / 100) for i in range(8)]             + [self.cand(120, 0.3), self.cand(120, 0.29)]
+        sel = fa.select_alerts(c, CFG, self.TODAY)
+        self.assertEqual(len(sel), 10)
+        self.assertEqual(self.split(sel)[2], 2)
+
+    def test_fewer_than_max_sends_all(self):
+        c = [self.cand(5, 0.9), self.cand(5, 0.8), self.cand(5, 0.7), self.cand(5, 0.6), self.cand(60, 0.4)]
+        self.assertEqual(len(fa.select_alerts(c, CFG, self.TODAY)), 5)
+
+    def test_config_validation(self):
+        fa.check_config(CFG)
+        bad_len = {"alert": {**CFG["alert"], "bucket_quota": [5, 5]}}
+        bad_sum = {"alert": {**CFG["alert"], "bucket_quota": [3, 4, 4]}}
+        for cfg in (bad_len, bad_sum):
+            with self.assertRaises(ValueError):
+                fa.check_config(cfg)
+
+
 if __name__ == "__main__":
     unittest.main()

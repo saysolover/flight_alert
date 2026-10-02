@@ -106,6 +106,28 @@ def judge(row, history, cfg, now):
     return {"median": median, "samples": len(prices), "drop": 1 - row["price"] / median}
 
 
+def check_config(cfg):
+    a = cfg["alert"]
+    if len(a["bucket_quota"]) != len(a["buckets"]) + 1:
+        raise ValueError("bucket_quota must have len(buckets)+1 entries")
+    if sum(a["bucket_quota"]) != a["max_alerts_per_run"]:
+        raise ValueError("bucket_quota must sum to max_alerts_per_run")
+
+
+def select_alerts(alerts, cfg, today):
+    """Pick up to max_alerts_per_run: per-bucket quota by drop, unused slots go to the next-best leftovers."""
+    a = cfg["alert"]
+    ranked = sorted(alerts, key=lambda x: -x[1]["drop"])
+    per = [[] for _ in a["bucket_quota"]]
+    for x in ranked:
+        per[bucket(days_to_dep(x[0], today), a["buckets"])].append(x)
+    chosen = [x for q, c in zip(a["bucket_quota"], per) for x in c[:q]]
+    left = [x for q, c in zip(a["bucket_quota"], per) for x in c[q:]]
+    left.sort(key=lambda x: -x[1]["drop"])
+    chosen += left[:a["max_alerts_per_run"] - len(chosen)]
+    return sorted(chosen, key=lambda x: -x[1]["drop"])
+
+
 def post(webhook, payload):
     req = urllib.request.Request(webhook, json.dumps(payload).encode(),
                                  {"Content-Type": "application/json", "User-Agent": "flight-alert"})
@@ -261,8 +283,7 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
             alerted["_warmup_notice"] = 1
         except OSError as e:
             print("warmup notice failed:", type(e).__name__, e)
-    alerts.sort(key=lambda a: -a[1]["drop"])
-    alerts = alerts[:cfg["alert"]["max_alerts_per_run"]]
+    alerts = select_alerts(alerts, cfg, now.date())
 
     if alerts:
         if webhook:
@@ -303,6 +324,7 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
 if __name__ == "__main__":
     with open("config.toml", "rb") as f:
         cfg = tomllib.load(f)
+    check_config(cfg)
     if "--test" in sys.argv:  # connectivity check only, no data touched
         r = {"kind": "ow", "o_ap": "ICN", "d_ap": "NRT", "dep_at": "2026-12-01T09:00:00+09:00", "ret_at": "",
              "airline": "TEST", "price": 100000, "gate": "test", "link": ""}
