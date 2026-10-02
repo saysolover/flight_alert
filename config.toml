@@ -22,3 +22,4 @@ realert_drop = 0.05    # re-alert same flight only if this much cheaper than las
 buckets = [30, 90]     # days-to-departure buckets: <=30, 31-90, >90
 max_price = 0          # 0 = off
 max_alerts_per_run = 10
+bucket_quota = [3, 4, 3]  # slots per bucket (len = len(buckets)+1, sum = max_alerts_per_run); unused slots spill over
