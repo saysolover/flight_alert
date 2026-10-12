@@ -1,4 +1,4 @@
-import tempfile, tomllib, unittest
+import csv, json, subprocess, sys, tempfile, tomllib, unittest
 from datetime import datetime, timedelta, timezone
 
 import flight_alert as fa
@@ -286,6 +286,258 @@ class QuotaTest(unittest.TestCase):
         for cfg in (bad_len, bad_sum):
             with self.assertRaises(ValueError):
                 fa.check_config(cfg)
+
+
+class AlternatingSpillTest(unittest.TestCase):
+    TODAY = NOW.date()
+
+    def cand(self, days, drop):
+        return QuotaTest.cand(self, days, drop)
+
+    def test_spill_goes_to_far_buckets_first_one_at_a_time(self):
+        c = [self.cand(5, 0.9 - i / 100) for i in range(6)] + [self.cand(60, 0.5 - i / 100) for i in range(8)]
+        sel = fa.select_alerts(c, CFG, self.TODAY)
+        n = QuotaTest.split(self, sel)
+        self.assertEqual(n, [4, 6, 0])          # 3 free slots: 31-90, <=30, 31-90
+        self.assertEqual(len(sel), 10)
+
+
+def write_obs(d, rows):
+    with open(f"{d}/obs-2026-09.csv", "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fa.FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(sorted(rows, key=lambda r: r["ts"]))
+
+
+EARLY = NOW.replace(hour=0, minute=10)       # 10 min after the 00:00Z slot: inside the grace period
+
+
+class CaptureMixin:
+    def setUp(self):
+        self.posts = []
+        self.orig = fa.post
+        fa.post = lambda w, p: self.posts.append(p) if "embeds" in p else None   # skip the one-time warm-up notice
+
+    def tearDown(self):
+        fa.post = self.orig
+
+
+class DigestFlowTest(CaptureMixin, unittest.TestCase):
+    def setup_dir(self, d):
+        write_obs(d, history())
+        return d
+
+    def test_collect_only_queues_candidates(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.setup_dir(d)
+            sent = fa.run(CFG, "t", "http://x", d, rows=[row(100000)], now=EARLY)
+            self.assertEqual((sent, self.posts), ([], []))
+            self.assertEqual(len(fa.read_json(f"{d}/pending.json")), 1)
+
+    def test_missed_digest_is_sent_once_after_grace(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.setup_dir(d)
+            fa.run(CFG, "t", "http://x", d, rows=[row(100000)], now=EARLY)
+            late = NOW.replace(hour=0, minute=40)                      # 40 min late
+            sent = fa.run(CFG, "t", "http://x", d, rows=[row(100000)], now=late)
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(len(self.posts), 1)
+            fa.run(CFG, "t", "http://x", d, rows=[row(100000)], now=late + timedelta(minutes=20))
+            self.assertEqual(len(self.posts), 1)                        # same slot: no duplicate
+            self.assertEqual(fa.read_json(f"{d}/pending.json"), {})
+
+    def test_digest_mode_sends_for_slot_and_not_twice(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.setup_dir(d)
+            fa.run(CFG, "t", "http://x", d, rows=[row(100000)], now=EARLY)
+            at = NOW.replace(hour=0, minute=0, second=5)
+            self.assertEqual(len(fa.run_digest(CFG, "http://x", d, now=at)), 1)
+            self.assertEqual(fa.run_digest(CFG, "http://x", d, now=at + timedelta(minutes=1)), [])
+            self.assertEqual(len(self.posts), 1)
+
+    def test_early_dispatch_maps_to_its_own_slot(self):
+        s = fa.slot_for(NOW.replace(hour=8, minute=55), [0, 9])
+        self.assertEqual((s.day, s.hour), (NOW.day, 9))
+
+    def test_failed_send_keeps_candidates_for_retry(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.setup_dir(d)
+            fa.run(CFG, "t", "http://x", d, rows=[row(100000)], now=EARLY)
+
+            def boom(w, p):
+                raise OSError("down")
+            fa.post = boom
+            self.assertEqual(fa.run_digest(CFG, "http://x", d, now=NOW.replace(hour=0, minute=1)), [])
+            self.assertEqual(len(fa.read_json(f"{d}/pending.json")), 1)
+            self.assertNotIn("last_digest_slot", fa.read_json(f"{d}/state.json"))
+
+    def test_pending_expires_after_48h_and_drops_when_price_rises(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.setup_dir(d)
+            fa.run(CFG, "t", "http://x", d, rows=[row(100000)], now=EARLY)
+            fa.run(CFG, "t", "http://x", d, rows=[row(149000)], now=EARLY + timedelta(minutes=5))
+            self.assertEqual(fa.read_json(f"{d}/pending.json"), {})     # price rose past the limit
+        with tempfile.TemporaryDirectory() as d:
+            self.setup_dir(d)
+            fa.run(CFG, "t", "http://x", d, rows=[row(100000)], now=EARLY)
+            late = EARLY + timedelta(hours=49)
+            self.assertEqual(fa.run_digest(CFG, "http://x", d, now=late.replace(hour=9, minute=0)), [])
+
+    def test_mode_dispatch_rejects_unknown_mode(self):
+        r = subprocess.run([sys.executable, "flight_alert.py", "--mode", "bogus"], capture_output=True, text=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unknown mode", r.stderr)
+
+
+class DigestGroupingTest(CaptureMixin, unittest.TestCase):
+    def pend(self, items):
+        out = {}
+        for i, (o, d, dep, price, airline) in enumerate(items):
+            r = dict(row(price, dep=dep, airline=airline), o_ap=o, d_ap=d)
+            ak = f"ow|{o}|{d}|{dep}|"
+            out[ak] = {"r": r, "j": {"median": 150000, "samples": 40, "drop": 1 - price / 150000, "limit": 10**9},
+                       "extra": {}, "fkey": ak, "found_at": "2026-09-20T00:00:00+00:00"}
+        return out
+
+    def digest(self, items):
+        with tempfile.TemporaryDirectory() as d:
+            for n, o in (("pending", self.pend(items)), ("alerted", {}), ("state", {})):
+                fa.write_json(f"{d}/{n}.json", o)
+            sent = fa.run_digest(CFG, "http://x", d, now=NOW.replace(hour=0, minute=1))
+            return sent, fa.read_json(f"{d}/pending.json"), fa.read_json(f"{d}/alerted.json")
+
+    def test_same_route_same_bucket_is_one_alert_with_other_dates(self):
+        sent, pending, alerted = self.digest([("ICN", "NRT", f"2026-09-{25 + i}", 90000 + i * 3000, "7C") for i in range(4)])
+        self.assertEqual(len(sent), 1)
+        e = self.posts[0]["embeds"][0]
+        self.assertIn("90,000원", e["description"])
+        self.assertIn("다른 날짜: 09/26 93,000 · 09/27 96,000 · 09/28 99,000", e["description"])
+        self.assertEqual((pending, len(alerted)), ({}, 4))             # all members recorded and cleared
+
+    def test_other_dates_capped_at_five_with_remainder(self):
+        sent, _, _ = self.digest([("ICN", "NRT", f"2026-09-{22 + i}", 90000 + i * 1000, "7C") for i in range(8)])
+        desc = self.posts[0]["embeds"][0]["description"]
+        self.assertEqual(desc.count(" · "), 4)
+        self.assertTrue(desc.split("\n")[-2].endswith("외 2"))
+
+    def test_freed_slots_go_to_other_routes(self):
+        items = [("ICN", "NRT", f"2026-09-{22 + i}", 80000 + i * 1000, "7C") for i in range(6)]   # one route, <=30d
+        items += [("ICN", d, "2026-09-25", 85000, "7C") for d in ("FUK", "KIX", "OKA", "NGO", "CTS", "HND")]
+        sent, pending, _ = self.digest(items)
+        self.assertEqual(len(sent), 7)                                  # 1 grouped NRT + 6 other routes
+        self.assertEqual(pending, {})
+
+    def test_same_route_in_different_buckets_is_sent_separately(self):
+        sent, _, _ = self.digest([("ICN", "NRT", "2026-09-25", 90000, "7C"), ("ICN", "NRT", "2026-11-25", 91000, "7C"),
+                                  ("ICN", "NRT", "2027-01-25", 92000, "7C")])
+        self.assertEqual(len(sent), 3)
+
+    def test_unselected_group_members_stay_pending(self):
+        items = [("ICN", d, "2026-09-25", 70000 + i, "7C") for i, d in enumerate("ABCDEFGHIJKL")]   # 12 routes, all <=30d
+        sent, pending, alerted = self.digest(items)
+        self.assertEqual(len(sent), 10)
+        self.assertEqual((len(pending), len(alerted)), (2, 10))
+
+
+def deal_hist(n=60, base=150000, offset=45):
+    # dep 45 days after each observation -> 31-90 day bucket; varied prices, median ~152000
+    out = []
+    for i in range(n):
+        ts = NOW - timedelta(days=1 + i % 50)
+        dep = (ts.date() + timedelta(days=offset)).isoformat()
+        out.append(row(base + (i % 5) * 1000, dep=dep, ts=ts))
+    return out
+
+
+DEAL_DEP = (NOW.date() + timedelta(days=45)).isoformat()
+
+
+class DealConditionTest(unittest.TestCase):
+    def deals(self, price=100000, hist=None, dep=DEAL_DEP):
+        return fa.find_deals([row(price, dep=dep)], hist if hist is not None else deal_hist(), CFG, NOW)
+
+    def test_passes_when_all_conditions_hold(self):
+        d = self.deals()
+        self.assertEqual(len(d), 1)
+        self.assertGreater(d[0]["drop"], 0.30)
+
+    def test_needs_15_days_left(self):
+        near = (NOW.date() + timedelta(days=14)).isoformat()
+        self.assertEqual(self.deals(dep=near, hist=deal_hist(offset=14)), [])
+        ok = (NOW.date() + timedelta(days=15)).isoformat()
+        self.assertEqual(len(self.deals(dep=ok, hist=deal_hist(offset=15))), 1)
+
+    def test_needs_50_samples(self):
+        self.assertEqual(self.deals(hist=deal_hist(n=49)), [])
+        self.assertEqual(len(self.deals(hist=deal_hist(n=50))), 1)
+
+    def test_must_be_series_wide_low_not_just_that_date(self):
+        other_date_low = row(95000, dep=(NOW.date() + timedelta(days=70)).isoformat(), ts=NOW - timedelta(days=2))
+        self.assertEqual(self.deals(hist=deal_hist() + [other_date_low]), [])
+
+    def test_other_series_low_does_not_block(self):
+        other = dict(row(50000, ts=NOW - timedelta(days=2)), d_ap="KIX")
+        self.assertEqual(len(self.deals(hist=deal_hist() + [other])), 1)
+
+    def test_needs_30_percent_below_median(self):
+        self.assertEqual(self.deals(price=110000), [])          # ~28% below
+        self.assertEqual(len(self.deals(price=105000)), 1)      # ~31% below
+
+
+class DealSendTest(CaptureMixin, unittest.TestCase):
+    def deal(self, dep, price=100000, o="ICN", d="NRT", airline="7C"):
+        r = dict(row(price, dep=dep, airline=airline), o_ap=o, d_ap=d)
+        return {"r": r, "drop": 0.34, "median": 150000, "samples": 60}
+
+    def send(self, deals, state=None, alerted=None, pending=None, now=NOW):
+        state = {} if state is None else state
+        return fa.send_deals(CFG, "http://x", deals, state, {} if alerted is None else alerted,
+                             {} if pending is None else pending, now), state
+
+    def test_same_series_dates_are_one_alert_and_one_cap_slot(self):
+        done, state = self.send([self.deal("2026-11-10"), self.deal("2026-11-11"), self.deal("2026-11-12")])
+        self.assertEqual(len(self.posts), 1)
+        desc = self.posts[0]["embeds"][0]["description"]
+        self.assertTrue(all(x in desc for x in ("2026-11-10", "2026-11-11", "2026-11-12")))
+        self.assertEqual(state["deals_day"]["n"], 1)
+        self.assertEqual(len(done), 3)
+
+    def test_deal_embed_is_visually_distinct_and_marked_reference_price(self):
+        self.send([self.deal("2026-11-10")])
+        e = self.posts[0]["embeds"][0]
+        self.assertTrue(e["title"].startswith("🔥 특가"))
+        self.assertIn("color", e)
+        self.assertIn("참고가", e["description"])
+
+    def test_daily_cap_of_three_and_resets_next_kst_day(self):
+        deals = [self.deal("2026-11-10", d=a) for a in ("NRT", "HND", "KIX", "FUK", "OKA")]
+        _, state = self.send(deals)
+        self.assertEqual(len(self.posts), 3)
+        self.send(deals, state=state, now=NOW + timedelta(hours=1))
+        self.assertEqual(len(self.posts), 3)                     # still capped (same KST day)
+        self.send([self.deal("2026-11-20", d="NGO")], state=state, now=NOW + timedelta(days=1))
+        self.assertEqual(len(self.posts), 4)                     # new KST day
+
+    def test_same_route_date_not_repeated_within_72h(self):
+        _, state = self.send([self.deal("2026-11-10")])
+        self.send([self.deal("2026-11-10", price=90000)], state=state, now=NOW + timedelta(hours=71))
+        self.assertEqual(len(self.posts), 1)
+        self.send([self.deal("2026-11-10", price=90000)], state=state, now=NOW + timedelta(hours=73))
+        self.assertEqual(len(self.posts), 2)
+
+    def test_sent_deal_leaves_pending_and_is_marked_alerted(self):
+        r = self.deal("2026-11-10")["r"]
+        ak = "|".join((r["kind"], r["o_ap"], r["d_ap"], "2026-11-10", ""))
+        pending, alerted = {ak: {"r": r}}, {}
+        self.send([self.deal("2026-11-10")], alerted=alerted, pending=pending)
+        self.assertEqual((pending, alerted[ak]), ({}, 100000))
+
+    def test_failed_deal_send_records_nothing(self):
+        def boom(w, p):
+            raise OSError("down")
+        fa.post = boom
+        done, state = self.send([self.deal("2026-11-10")])
+        self.assertEqual((done, state.get("deals_sent"), state["deals_day"]["n"]), (set(), {}, 0))
 
 
 if __name__ == "__main__":
