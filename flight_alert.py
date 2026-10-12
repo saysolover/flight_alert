@@ -148,6 +148,10 @@ def notify(webhook, alerts):
                 f"출발 {r['dep_at'][:16]}" + (f" / 귀국 {r['ret_at'][:16]}" if r["ret_at"] else ""))
         if extra.get("ow_sum"):
             desc += f"\n편도 합산 {extra['ow_sum']:,}원"
+        if extra.get("others"):
+            shown = extra["others"][:5]
+            more = len(extra["others"]) - len(shown)
+            desc += "\n다른 날짜: " + " · ".join(f"{d[5:7]}/{d[8:10]} {p:,}" for d, p in shown) + (f" 외 {more}" if more else "")
         desc += "\n_캐시 기반 참고가입니다. 예약 전 재확인하세요._"
         embed = {"title": f"{r['o_ap']} → {r['d_ap']} · {kind}", "description": desc}
         if r["link"]:
@@ -196,12 +200,31 @@ def pending_cands(pending, alerted, a, now):
             if v["r"]["price"] <= alerted.get(k, 1 << 60) * (1 - a["realert_drop"])]
 
 
+def group_cands(cands, cfg, today):
+    """One representative (cheapest) per series+airline+bucket; the rest are listed as other dates.
+    Returns (row, judge info, extra, key, member keys)."""
+    groups = {}
+    for c in cands:
+        r = c[0]
+        b = bucket(days_to_dep(r, today), cfg["alert"]["buckets"])
+        groups.setdefault((r["kind"], r["o_ap"], r["d_ap"], r["airline"], b), []).append(c)
+    reps = []
+    for g in groups.values():
+        g.sort(key=lambda c: c[0]["price"])
+        extra = dict(g[0][2])
+        if len(g) > 1:
+            extra["others"] = [(c[0]["dep_at"][:10], c[0]["price"]) for c in g[1:]]
+        reps.append((g[0][0], g[0][1], extra, g[0][3], [c[3] for c in g]))
+    return reps
+
+
 def send_digest(cfg, webhook, pending, alerted, state, now, slot):
     """Send the batch for `slot`; returns the items sent. State is only advanced on success."""
-    sel = select_alerts(pending_cands(pending, alerted, cfg["alert"], now), cfg, now.date())
+    reps = group_cands(pending_cands(pending, alerted, cfg["alert"], now), cfg, now.date())
+    sel = select_alerts(reps, cfg, now.date())
     if webhook is None:
-        for r, j, _, _ in sel:
-            print("DIGEST", r["o_ap"], r["d_ap"], r["dep_at"][:10], r["price"], f"-{j['drop']:.0%}")
+        for r, j, extra, _, members in sel:
+            print("DIGEST", r["o_ap"], r["d_ap"], r["dep_at"][:10], r["price"], f"-{j['drop']:.0%}", f"(+{len(members) - 1} dates)")
         return []
     try:
         if sel:
@@ -209,9 +232,10 @@ def send_digest(cfg, webhook, pending, alerted, state, now, slot):
     except OSError as e:  # retried by the next collect run
         print("digest failed:", type(e).__name__, e)
         return []
-    for r, _, _, k in sel:
-        alerted[k] = r["price"]
-        pending.pop(k, None)
+    for x in sel:
+        for k in x[4]:
+            alerted[k] = pending[k]["r"]["price"]
+            del pending[k]
     state["last_digest_slot"] = slot.isoformat()
     return sel
 

@@ -389,6 +389,56 @@ class DigestFlowTest(CaptureMixin, unittest.TestCase):
         self.assertIn("unknown mode", r.stderr)
 
 
+class DigestGroupingTest(CaptureMixin, unittest.TestCase):
+    def pend(self, items):
+        out = {}
+        for i, (o, d, dep, price, airline) in enumerate(items):
+            r = dict(row(price, dep=dep, airline=airline), o_ap=o, d_ap=d)
+            ak = f"ow|{o}|{d}|{dep}|"
+            out[ak] = {"r": r, "j": {"median": 150000, "samples": 40, "drop": 1 - price / 150000, "limit": 10**9},
+                       "extra": {}, "fkey": ak, "found_at": "2026-09-20T00:00:00+00:00"}
+        return out
+
+    def digest(self, items):
+        with tempfile.TemporaryDirectory() as d:
+            for n, o in (("pending", self.pend(items)), ("alerted", {}), ("state", {})):
+                fa.write_json(f"{d}/{n}.json", o)
+            sent = fa.run_digest(CFG, "http://x", d, now=NOW.replace(hour=0, minute=1))
+            return sent, fa.read_json(f"{d}/pending.json"), fa.read_json(f"{d}/alerted.json")
+
+    def test_same_route_same_bucket_is_one_alert_with_other_dates(self):
+        sent, pending, alerted = self.digest([("ICN", "NRT", f"2026-09-{25 + i}", 90000 + i * 3000, "7C") for i in range(4)])
+        self.assertEqual(len(sent), 1)
+        e = self.posts[0]["embeds"][0]
+        self.assertIn("90,000원", e["description"])
+        self.assertIn("다른 날짜: 09/26 93,000 · 09/27 96,000 · 09/28 99,000", e["description"])
+        self.assertEqual((pending, len(alerted)), ({}, 4))             # all members recorded and cleared
+
+    def test_other_dates_capped_at_five_with_remainder(self):
+        sent, _, _ = self.digest([("ICN", "NRT", f"2026-09-{22 + i}", 90000 + i * 1000, "7C") for i in range(8)])
+        desc = self.posts[0]["embeds"][0]["description"]
+        self.assertEqual(desc.count(" · "), 4)
+        self.assertTrue(desc.split("\n")[-2].endswith("외 2"))
+
+    def test_freed_slots_go_to_other_routes(self):
+        items = [("ICN", "NRT", f"2026-09-{22 + i}", 80000 + i * 1000, "7C") for i in range(6)]   # one route, <=30d
+        items += [("ICN", d, "2026-09-25", 85000, "7C") for d in ("FUK", "KIX", "OKA", "NGO", "CTS", "HND")]
+        sent, pending, _ = self.digest(items)
+        self.assertEqual(len(sent), 7)                                  # 1 grouped NRT + 6 other routes
+        self.assertEqual(pending, {})
+
+    def test_same_route_in_different_buckets_is_sent_separately(self):
+        sent, _, _ = self.digest([("ICN", "NRT", "2026-09-25", 90000, "7C"), ("ICN", "NRT", "2026-11-25", 91000, "7C"),
+                                  ("ICN", "NRT", "2027-01-25", 92000, "7C")])
+        self.assertEqual(len(sent), 3)
+
+    def test_unselected_group_members_stay_pending(self):
+        items = [("ICN", d, "2026-09-25", 70000 + i, "7C") for i, d in enumerate("ABCDEFGHIJKL")]   # 12 routes, all <=30d
+        sent, pending, alerted = self.digest(items)
+        self.assertEqual(len(sent), 10)
+        self.assertEqual((len(pending), len(alerted)), (2, 10))
+
+
 def deal_hist(n=60, base=150000, offset=45):
     # dep 45 days after each observation -> 31-90 day bucket; varied prices, median ~152000
     out = []
