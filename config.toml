@@ -22,4 +22,15 @@ realert_drop = 0.05    # re-alert same flight only if this much cheaper than las
 buckets = [30, 90]     # days-to-departure buckets: <=30, 31-90, >90
 max_price = 0          # 0 = off
 max_alerts_per_run = 10
+digest_slots_utc = [0, 9]   # 09:00 and 18:00 KST
+digest_grace_min = 30      # collect sends a digest itself if the scheduled one is this late
+pending_hours = 48         # candidates older than this are dropped
 bucket_quota = [3, 4, 3]  # slots per bucket (len = len(buckets)+1, sum = max_alerts_per_run); unused slots spill over
+
+# Instant single alerts for standout fares (all conditions must hold)
+[deal]
+min_days = 15       # at least this many days until departure
+min_samples = 50    # samples in the same series/bucket over lookback_days
+drop = 0.30         # at least this far below that median; also an all-time low for the whole series
+daily_cap = 3       # alerts per KST day (one alert may list several departure dates)
+repeat_hours = 72   # same route+departure date is not alerted again within this time

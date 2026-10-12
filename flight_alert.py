@@ -98,12 +98,13 @@ def judge(row, history, cfg, now):
         return None
     prices = sorted(h["price"] for h in series)
     median = prices[len(prices) // 2]
-    if row["price"] > percentile(prices, a["percentile"]) or row["price"] > median * (1 - a["min_drop"]):
+    limit = min(percentile(prices, a["percentile"]), median * (1 - a["min_drop"]))
+    if row["price"] > limit:
         return None
     same = [h["price"] for h in series if h["dep_at"][:10] == row["dep_at"][:10] and h["ret_at"][:10] == row["ret_at"][:10]]
     if same and row["price"] >= min(same):
         return None  # not a new low for this departure
-    return {"median": median, "samples": len(prices), "drop": 1 - row["price"] / median}
+    return {"median": median, "samples": len(prices), "drop": 1 - row["price"] / median, "limit": limit}
 
 
 def check_config(cfg):
@@ -115,16 +116,20 @@ def check_config(cfg):
 
 
 def select_alerts(alerts, cfg, today):
-    """Pick up to max_alerts_per_run: per-bucket quota by drop, unused slots go to the next-best leftovers."""
+    """Pick up to max_alerts_per_run: per-bucket quota by drop; unused slots go to the other buckets
+    one at a time, farthest bucket first, best drop first within a bucket."""
     a = cfg["alert"]
-    ranked = sorted(alerts, key=lambda x: -x[1]["drop"])
     per = [[] for _ in a["bucket_quota"]]
-    for x in ranked:
+    for x in sorted(alerts, key=lambda x: -x[1]["drop"]):
         per[bucket(days_to_dep(x[0], today), a["buckets"])].append(x)
     chosen = [x for q, c in zip(a["bucket_quota"], per) for x in c[:q]]
-    left = [x for q, c in zip(a["bucket_quota"], per) for x in c[q:]]
-    left.sort(key=lambda x: -x[1]["drop"])
-    chosen += left[:a["max_alerts_per_run"] - len(chosen)]
+    left = [list(c[q:]) for q, c in zip(a["bucket_quota"], per)]
+    slots = a["max_alerts_per_run"] - len(chosen)
+    while slots > 0 and any(left):
+        for c in reversed(left):
+            if slots > 0 and c:
+                chosen.append(c.pop(0))
+                slots -= 1
     return sorted(chosen, key=lambda x: -x[1]["drop"])
 
 
@@ -160,6 +165,130 @@ def warmup_notice(webhook, history, min_samples):
     ready = sum(1 for n in series.values() if n >= min_samples)
     post(webhook, {"content": f"학습 기간이 끝났습니다. 지금부터 유의하게 낮은 가격이 나오면 알림을 보냅니다.\n"
                               f"누적 관측 {len(history):,}건, 노선 시리즈 {len(series)}개 중 {ready}개가 표본 {min_samples}건 이상입니다."})
+
+
+KST = timezone(timedelta(hours=9))
+
+
+def slot_for(now, slots):
+    """Latest digest slot (UTC hours) not later than now + 15 min, so an early dispatch maps to its own slot."""
+    t = now + timedelta(minutes=15)
+    cs = [t.replace(hour=h, minute=0, second=0, microsecond=0) for h in slots]
+    cs += [c - timedelta(days=1) for c in cs]
+    return max(c for c in cs if c <= t)
+
+
+def due_digest(state, now, a, force=False):
+    """Slot to send now, or None. Not due if already sent for the slot, or (unless forced) within the grace period."""
+    slot = slot_for(now, a["digest_slots_utc"])
+    if state.get("last_digest_slot", "") >= slot.isoformat():
+        return None
+    if not force and now - slot < timedelta(minutes=a["digest_grace_min"]):
+        return None
+    return slot
+
+
+def pending_cands(pending, alerted, a, now):
+    cutoff = (now - timedelta(hours=a["pending_hours"])).isoformat(timespec="seconds")
+    for k in [k for k, v in pending.items() if v["found_at"] < cutoff or v["r"]["dep_at"][:10] < now.date().isoformat()]:
+        del pending[k]
+    return [(v["r"], v["j"], v["extra"], k) for k, v in pending.items()
+            if v["r"]["price"] <= alerted.get(k, 1 << 60) * (1 - a["realert_drop"])]
+
+
+def send_digest(cfg, webhook, pending, alerted, state, now, slot):
+    """Send the batch for `slot`; returns the items sent. State is only advanced on success."""
+    sel = select_alerts(pending_cands(pending, alerted, cfg["alert"], now), cfg, now.date())
+    if webhook is None:
+        for r, j, _, _ in sel:
+            print("DIGEST", r["o_ap"], r["d_ap"], r["dep_at"][:10], r["price"], f"-{j['drop']:.0%}")
+        return []
+    try:
+        if sel:
+            notify(webhook, [x[:3] for x in sel])
+    except OSError as e:  # retried by the next collect run
+        print("digest failed:", type(e).__name__, e)
+        return []
+    for r, _, _, k in sel:
+        alerted[k] = r["price"]
+        pending.pop(k, None)
+    state["last_digest_slot"] = slot.isoformat()
+    return sel
+
+
+def find_deals(rows, history, cfg, now):
+    """D2: >= min_days left, >= min_samples in the 60d bucket series, series-wide all-time low, >= drop below median."""
+    d, edges = cfg["deal"], cfg["alert"]["buckets"]
+    by, low = {}, {}
+    for h in history:
+        k = (h["kind"], h["o_ap"], h["d_ap"])
+        by.setdefault(k, []).append(h)
+        low[k] = min(low.get(k, 1 << 60), h["price"])
+    since = (now - timedelta(days=cfg["alert"]["lookback_days"])).isoformat(timespec="seconds")
+    out = []
+    for r in rows:
+        days = days_to_dep(r, now.date())
+        k = (r["kind"], r["o_ap"], r["d_ap"])
+        if days < d["min_days"] or k not in low or r["price"] >= low[k]:
+            continue
+        b = bucket(days, edges)
+        ser = [h["price"] for h in by[k] if h["ts"] >= since
+               and bucket(days_to_dep(h, date.fromisoformat(h["ts"][:10])), edges) == b]
+        if len(ser) < d["min_samples"]:
+            continue
+        med = statistics.median(ser)
+        if r["price"] <= med * (1 - d["drop"]):
+            out.append({"r": r, "drop": 1 - r["price"] / med, "median": med, "samples": len(ser)})
+    return out
+
+
+def deal_embed(g):
+    rs = g["rows"]
+    r0 = min((x["r"] for x in rs), key=lambda r: r["price"])
+    kind = "왕복" if r0["kind"] == "rt" else "편도"
+    lines = [f"{x['r']['dep_at'][:10]}" + (f" ~ {x['r']['ret_at'][:10]}" if x["r"]["ret_at"] else "")
+             + f"  {x['r']['price']:,}원 (평소 대비 -{x['drop']:.0%})" for x in sorted(rs, key=lambda x: x["r"]["dep_at"])]
+    return {"title": f"🔥 특가 · {r0['o_ap']}→{r0['d_ap']} {kind} {r0['price']:,}원 (평소 대비 -{g['drop']:.0%})",
+            "description": f"항공사 {r0['airline']}\n" + "\n".join(lines) + "\n_캐시 기반 참고가입니다. 예약 전 재확인하세요._",
+            "color": 0xE67E22}
+
+
+def send_deals(cfg, webhook, deals, state, alerted, pending, now):
+    """Group by series+airline (one alert per group), enforce 72h repeat and daily cap. Returns sent alert keys."""
+    d = cfg["deal"]
+    day = now.astimezone(KST).date().isoformat()
+    if state.get("deals_day", {}).get("d") != day:
+        state["deals_day"] = {"d": day, "n": 0}
+    keep = (now - timedelta(hours=d["repeat_hours"])).isoformat(timespec="seconds")
+    sent = state["deals_sent"] = {k: v for k, v in state.get("deals_sent", {}).items() if v >= keep}
+    groups = {}
+    for x in deals:
+        r = x["r"]
+        if "|".join((r["kind"], r["o_ap"], r["d_ap"], r["dep_at"][:10])) in sent:
+            continue
+        groups.setdefault((r["kind"], r["o_ap"], r["d_ap"], r["airline"]), []).append(x)
+    ranked = sorted(({"rows": v, "drop": max(x["drop"] for x in v)} for v in groups.values()), key=lambda g: -g["drop"])
+    done = set()
+    for g in ranked:
+        if state["deals_day"]["n"] >= d["daily_cap"]:
+            break
+        if webhook is None:
+            print("DEAL", deal_embed(g)["title"])
+            continue
+        try:
+            post(webhook, {"embeds": [deal_embed(g)]})
+        except OSError as e:  # rows stay regular pending candidates
+            print("deal failed:", type(e).__name__, e)
+            continue
+        state["deals_day"]["n"] += 1
+        for x in g["rows"]:
+            r = x["r"]
+            sent["|".join((r["kind"], r["o_ap"], r["d_ap"], r["dep_at"][:10]))] = now.isoformat(timespec="seconds")
+            ak = "|".join((r["kind"], r["o_ap"], r["d_ap"], r["dep_at"][:10], r["ret_at"][:10]))
+            alerted[ak] = r["price"]
+            pending.pop(ak, None)
+            done.add(ak)
+    return done
 
 
 def build_summary(rows, origins, now, min_samples=30, back_min_days=7, classes=None):
@@ -245,12 +374,12 @@ def build_dates(rows, origins, now, classes, airports):
     return {"updated": now.isoformat(timespec="seconds"), "airports": out}
 
 
-def run(cfg, token, webhook, data_dir="data", rows=None):
-    now = datetime.now(timezone.utc)
+def run(cfg, token, webhook, data_dir="data", rows=None, now=None):
+    now = now or datetime.now(timezone.utc)
     os.makedirs(data_dir, exist_ok=True)
     last_p, alerted_p = os.path.join(data_dir, "last.json"), os.path.join(data_dir, "alerted.json")
-    last = read_json(last_p)
-    alerted = read_json(alerted_p)
+    pending_p, state_p = os.path.join(data_dir, "pending.json"), os.path.join(data_dir, "state.json")
+    last, alerted, pending, state = read_json(last_p), read_json(alerted_p), read_json(pending_p), read_json(state_p)
     history = load_history(data_dir)
 
     rows = list(fetch_all(token, cfg)) if rows is None else rows
@@ -263,12 +392,21 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
             k = (r["o_ap"], r["d_ap"], r["dep_at"][:10])
             ow_min[k] = min(ow_min.get(k, r["price"]), r["price"])
 
-    alerts = []
-    warm = history and history[0]["ts"] <= (now - timedelta(days=cfg["alert"]["warmup_days"])).isoformat(timespec="seconds")
+    a = cfg["alert"]
+    warm = history and history[0]["ts"] <= (now - timedelta(days=a["warmup_days"])).isoformat(timespec="seconds")
+    if warm and webhook and "_warmup_notice" not in alerted:
+        try:
+            warmup_notice(webhook, history, a["min_samples"])
+            alerted["_warmup_notice"] = 1
+        except OSError as e:
+            print("warmup notice failed:", type(e).__name__, e)
+
+    sent = []
+    dealt = send_deals(cfg, webhook, find_deals(changed, history, cfg, now), state, alerted, pending, now) if warm else set()
     for r in changed if warm else []:
-        j = judge(r, history, cfg, now)
         ak = "|".join((r["kind"], r["o_ap"], r["d_ap"], r["dep_at"][:10], r["ret_at"][:10]))
-        if j and r["price"] <= alerted.get(ak, 1 << 60) * (1 - cfg["alert"]["realert_drop"]):
+        j = None if ak in dealt else judge(r, history, cfg, now)
+        if j and r["price"] <= alerted.get(ak, 1 << 60) * (1 - a["realert_drop"]):
             extra = {}
             if r["kind"] == "rt":
                 extra["nights"] = (date.fromisoformat(r["ret_at"][:10]) - date.fromisoformat(r["dep_at"][:10])).days
@@ -276,26 +414,18 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
                 back = ow_min.get((r["d_ap"], r["o_ap"], r["ret_at"][:10]))
                 if out and back:
                     extra["ow_sum"] = out + back
-            alerts.append((r, j, extra, ak))
-    if warm and webhook and "_warmup_notice" not in alerted:
-        try:
-            warmup_notice(webhook, history, cfg["alert"]["min_samples"])
-            alerted["_warmup_notice"] = 1
-        except OSError as e:
-            print("warmup notice failed:", type(e).__name__, e)
-    alerts = select_alerts(alerts, cfg, now.date())
-
-    if alerts:
-        if webhook:
-            try:
-                notify(webhook, [a[:3] for a in alerts])
-                for r, _, _, ak in alerts:
-                    alerted[ak] = r["price"]
-            except OSError as e:  # keep collecting data even if Discord is down
-                print("notify failed:", type(e).__name__, e)
-        else:
-            for r, j, _, _ in alerts:
-                print("ALERT", r["o_ap"], r["d_ap"], r["dep_at"][:10], r["price"], f"-{j['drop']:.0%}")
+            if ak not in pending or r["price"] < pending[ak]["r"]["price"]:
+                found = pending.get(ak, {}).get("found_at", now.isoformat(timespec="seconds"))
+                pending[ak] = {"r": r, "j": j, "extra": extra, "fkey": key(r), "found_at": found}
+    prices = {key(r): r["price"] for r in rows}
+    for k in [k for k, v in pending.items() if prices.get(v["fkey"], 0) > v["j"]["limit"]]:
+        del pending[k]  # price rose out of the criteria
+    for v in pending.values():
+        if v["fkey"] in prices:
+            v["r"]["price"] = prices[v["fkey"]]
+    slot = due_digest(state, now, a)  # catch up a digest the scheduler missed
+    if slot:
+        sent += send_digest(cfg, webhook, pending, alerted, state, now, slot)
 
     if changed:
         path = os.path.join(data_dir, f"obs-{now:%Y-%m}.csv")
@@ -312,13 +442,31 @@ def run(cfg, token, webhook, data_dir="data", rows=None):
     last = {k: v for k, v in last.items() if k.split("|")[3][:10] >= today}
     write_json(last_p, last)
     write_json(alerted_p, alerted)
+    write_json(pending_p, pending)
+    write_json(state_p, state)
     origins, classes = cfg["search"]["origins"], cfg.get("classes")
     summary = build_summary(rows, origins, now, classes=classes)
     write_json(os.path.join(data_dir, "summary.json"), summary)
     write_json(os.path.join(data_dir, "dates.json"),
                build_dates(rows, origins, now, classes or {}, set(summary["airports"])), separators=(",", ":"))
-    print(f"fetched={len(rows)} changed={len(changed)} alerts={len(alerts)}")
-    return alerts
+    print(f"fetched={len(rows)} changed={len(changed)} pending={len(pending)} sent={len(sent)} deals={len(dealt)}")
+    return sent
+
+
+def run_digest(cfg, webhook, data_dir="data", now=None):
+    """mode=digest: send the batch for the current slot from data/pending.json (no collection)."""
+    now = now or datetime.now(timezone.utc)
+    paths = {n: os.path.join(data_dir, n + ".json") for n in ("pending", "alerted", "state")}
+    pending, alerted, state = (read_json(paths[n]) for n in ("pending", "alerted", "state"))
+    slot = due_digest(state, now, cfg["alert"], force=True)
+    if not slot:
+        print("digest already sent for this slot")
+        return []
+    sent = send_digest(cfg, webhook, pending, alerted, state, now, slot)
+    for n, obj in (("pending", pending), ("alerted", alerted), ("state", state)):
+        write_json(paths[n], obj)
+    print(f"digest sent={len(sent)} pending={len(pending)}")
+    return sent
 
 
 if __name__ == "__main__":
@@ -331,4 +479,10 @@ if __name__ == "__main__":
         notify(os.environ["DISCORD_WEBHOOK"], [(r, {"median": 150000, "samples": 0, "drop": 0.33}, {})])
         print("test message sent")
         sys.exit(0)
-    run(cfg, os.environ["TRAVELPAYOUTS_TOKEN"], os.environ.get("DISCORD_WEBHOOK"))
+    mode = sys.argv[sys.argv.index("--mode") + 1] if "--mode" in sys.argv else "collect"
+    if mode == "digest":
+        run_digest(cfg, os.environ.get("DISCORD_WEBHOOK") or None)
+    elif mode == "collect":
+        run(cfg, os.environ["TRAVELPAYOUTS_TOKEN"], os.environ.get("DISCORD_WEBHOOK") or None)
+    else:
+        sys.exit(f"unknown mode: {mode}")
