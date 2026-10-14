@@ -498,7 +498,8 @@ class DealSendTest(CaptureMixin, unittest.TestCase):
         done, state = self.send([self.deal("2026-11-10"), self.deal("2026-11-11"), self.deal("2026-11-12")])
         self.assertEqual(len(self.posts), 1)
         desc = self.posts[0]["embeds"][0]["description"]
-        self.assertTrue(all(x in desc for x in ("2026-11-10", "2026-11-11", "2026-11-12")))
+        self.assertIn("출발 2026-11-10", desc)
+        self.assertIn("다른 날짜: 11/11 100,000 · 11/12 100,000", desc)
         self.assertEqual(state["deals_day"]["n"], 1)
         self.assertEqual(len(done), 3)
 
@@ -540,37 +541,46 @@ class DealSendTest(CaptureMixin, unittest.TestCase):
         self.assertEqual((done, state.get("deals_sent"), state["deals_day"]["n"]), (set(), {}, 0))
 
 
-class DealLinkTest(unittest.TestCase):
-    def x(self, dep, price, link):
-        r = dict(row(price, dep=dep), o_ap="ICN", d_ap="KMJ", link=link)
-        return {"r": r, "drop": 0.55, "median": 260000, "samples": 76}
+class DealEmbedTest(unittest.TestCase):
+    def x(self, dep, price, link="", ret="", drop=0.55):
+        r = dict(row(price, dep=dep, ret=ret + ("T19:00:00+09:00" if ret else ""), kind="rt" if ret else "ow"),
+                 o_ap="ICN", d_ap="KMJ", link=link)
+        return {"r": r, "drop": drop, "median": 260000, "samples": 76}
 
     def embed(self, *xs):
         return fa.deal_embed({"rows": list(xs), "drop": 0.55})
 
-    def test_title_links_to_cheapest_row_and_each_line_has_book_link(self):
-        e = self.embed(self.x("2026-11-01", 116359, "/s/a"), self.x("2026-10-31", 116375, "/s/b"))
+    def test_same_layout_as_digest_embed_with_deal_marks(self):
+        x = self.x("2026-11-01", 116359, "/s/a")
+        e = self.embed(x)
+        d = fa.alert_embed(x["r"], x, {})
+        self.assertEqual(e["description"], d["description"])
+        self.assertEqual(e["title"], "🔥 특가 · " + d["title"])
+        self.assertEqual(e["color"], 0xE67E22)
         self.assertEqual(e["url"], "https://www.aviasales.com/s/a")
-        self.assertIn("2026-11-01  116,359원 (평소 대비 -55%) [예약](https://www.aviasales.com/s/a)", e["description"])
-        self.assertIn("[예약](https://www.aviasales.com/s/b)", e["description"])
+        self.assertIn("중앙값 260,000원 대비 -55%", e["description"])
 
-    def test_no_link_means_no_url_and_plain_line(self):
-        e = self.embed(self.x("2026-11-01", 116359, ""))
+    def test_no_link_means_no_url_and_no_line_links(self):
+        e = self.embed(self.x("2026-11-01", 116359))
         self.assertNotIn("url", e)
         self.assertNotIn("[예약]", e["description"])
-        self.assertIn("2026-11-01  116,359원 (평소 대비 -55%)", e["description"])
 
-    def test_mixed_links_only_linked_lines_get_book(self):
-        e = self.embed(self.x("2026-11-01", 100000, "/s/a"), self.x("2026-11-02", 110000, ""))
-        self.assertEqual(e["description"].count("[예약]"), 1)
-
-    def test_over_4096_drops_line_links_but_keeps_every_date(self):
-        xs = [self.x(f"2026-{1 + i // 28:02d}-{1 + i % 28:02d}", 100000 + i, "/s/" + "x" * 80) for i in range(60)]
-        e = self.embed(*xs)
-        self.assertLessEqual(len(e["description"]), 4096)
+    def test_representative_is_cheapest_and_others_listed_ascending(self):
+        e = self.embed(self.x("2026-11-02", 120000, "/s/b"), self.x("2026-11-01", 116359, "/s/a"),
+                       self.x("2026-11-03", 118000, "/s/c"))
+        self.assertEqual(e["url"], "https://www.aviasales.com/s/a")
+        self.assertIn("출발 2026-11-01", e["description"])
+        self.assertIn("다른 날짜: 11/03 118,000 · 11/02 120,000", e["description"])
         self.assertNotIn("[예약]", e["description"])
-        self.assertEqual(e["description"].count("원 (평소 대비"), 60)
-        self.assertTrue(e["url"].startswith("https://www.aviasales.com/s/"))
+
+    def test_others_capped_at_five(self):
+        e = self.embed(*[self.x(f"2026-11-{1 + i:02d}", 100000 + i * 100) for i in range(8)])
+        self.assertTrue(e["description"].split("\n")[-2].endswith("외 2"))
+
+    def test_round_trip_shows_nights_and_return(self):
+        e = self.embed(self.x("2026-11-01", 200000, ret="2026-11-06"))
+        self.assertIn("왕복 5박", e["title"])
+        self.assertIn("귀국 2026-11-06", e["description"])
 
 
 if __name__ == "__main__":
