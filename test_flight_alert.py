@@ -540,5 +540,38 @@ class DealSendTest(CaptureMixin, unittest.TestCase):
         self.assertEqual((done, state.get("deals_sent"), state["deals_day"]["n"]), (set(), {}, 0))
 
 
+class DealLinkTest(unittest.TestCase):
+    def x(self, dep, price, link):
+        r = dict(row(price, dep=dep), o_ap="ICN", d_ap="KMJ", link=link)
+        return {"r": r, "drop": 0.55, "median": 260000, "samples": 76}
+
+    def embed(self, *xs):
+        return fa.deal_embed({"rows": list(xs), "drop": 0.55})
+
+    def test_title_links_to_cheapest_row_and_each_line_has_book_link(self):
+        e = self.embed(self.x("2026-11-01", 116359, "/s/a"), self.x("2026-10-31", 116375, "/s/b"))
+        self.assertEqual(e["url"], "https://www.aviasales.com/s/a")
+        self.assertIn("2026-11-01  116,359원 (평소 대비 -55%) [예약](https://www.aviasales.com/s/a)", e["description"])
+        self.assertIn("[예약](https://www.aviasales.com/s/b)", e["description"])
+
+    def test_no_link_means_no_url_and_plain_line(self):
+        e = self.embed(self.x("2026-11-01", 116359, ""))
+        self.assertNotIn("url", e)
+        self.assertNotIn("[예약]", e["description"])
+        self.assertIn("2026-11-01  116,359원 (평소 대비 -55%)", e["description"])
+
+    def test_mixed_links_only_linked_lines_get_book(self):
+        e = self.embed(self.x("2026-11-01", 100000, "/s/a"), self.x("2026-11-02", 110000, ""))
+        self.assertEqual(e["description"].count("[예약]"), 1)
+
+    def test_over_4096_drops_line_links_but_keeps_every_date(self):
+        xs = [self.x(f"2026-{1 + i // 28:02d}-{1 + i % 28:02d}", 100000 + i, "/s/" + "x" * 80) for i in range(60)]
+        e = self.embed(*xs)
+        self.assertLessEqual(len(e["description"]), 4096)
+        self.assertNotIn("[예약]", e["description"])
+        self.assertEqual(e["description"].count("원 (평소 대비"), 60)
+        self.assertTrue(e["url"].startswith("https://www.aviasales.com/s/"))
+
+
 if __name__ == "__main__":
     unittest.main()

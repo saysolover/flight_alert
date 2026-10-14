@@ -3,6 +3,7 @@ import csv, glob, json, os, statistics, sys, time, tomllib, urllib.error, urllib
 from datetime import date, datetime, timedelta, timezone
 
 API = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
+BOOK = "https://www.aviasales.com"
 FIELDS = ["ts", "kind", "o_ap", "d_ap", "dep_at", "ret_at", "airline", "price"]
 
 
@@ -155,7 +156,7 @@ def notify(webhook, alerts):
         desc += "\n_캐시 기반 참고가입니다. 예약 전 재확인하세요._"
         embed = {"title": f"{r['o_ap']} → {r['d_ap']} · {kind}", "description": desc}
         if r["link"]:
-            embed["url"] = "https://www.aviasales.com" + r["link"]
+            embed["url"] = BOOK + r["link"]
         embeds.append(embed)
     for i in range(0, len(embeds), 10):
         post(webhook, {"embeds": embeds[i:i + 10]})
@@ -270,11 +271,20 @@ def deal_embed(g):
     rs = g["rows"]
     r0 = min((x["r"] for x in rs), key=lambda r: r["price"])
     kind = "왕복" if r0["kind"] == "rt" else "편도"
-    lines = [f"{x['r']['dep_at'][:10]}" + (f" ~ {x['r']['ret_at'][:10]}" if x["r"]["ret_at"] else "")
-             + f"  {x['r']['price']:,}원 (평소 대비 -{x['drop']:.0%})" for x in sorted(rs, key=lambda x: x["r"]["dep_at"])]
-    return {"title": f"🔥 특가 · {r0['o_ap']}→{r0['d_ap']} {kind} {r0['price']:,}원 (평소 대비 -{g['drop']:.0%})",
-            "description": f"항공사 {r0['airline']}\n" + "\n".join(lines) + "\n_캐시 기반 참고가입니다. 예약 전 재확인하세요._",
-            "color": 0xE67E22}
+    def text(links):
+        lines = [f"{x['r']['dep_at'][:10]}" + (f" ~ {x['r']['ret_at'][:10]}" if x["r"]["ret_at"] else "")
+                 + f"  {x['r']['price']:,}원 (평소 대비 -{x['drop']:.0%})"
+                 + (f" [예약]({BOOK}{x['r']['link']})" if links and x["r"]["link"] else "")
+                 for x in sorted(rs, key=lambda x: x["r"]["dep_at"])]
+        return f"항공사 {r0['airline']}\n" + "\n".join(lines) + "\n_캐시 기반 참고가입니다. 예약 전 재확인하세요._"
+    desc = text(True)
+    if len(desc) > 4096:  # Discord embed limit: drop the per-line links, keep every date line
+        desc = text(False)
+    embed = {"title": f"🔥 특가 · {r0['o_ap']}→{r0['d_ap']} {kind} {r0['price']:,}원 (평소 대비 -{g['drop']:.0%})",
+             "description": desc, "color": 0xE67E22}
+    if r0["link"]:
+        embed["url"] = BOOK + r0["link"]
+    return embed
 
 
 def send_deals(cfg, webhook, deals, state, alerted, pending, now):
