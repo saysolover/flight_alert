@@ -140,24 +140,26 @@ def post(webhook, payload):
     urllib.request.urlopen(req, timeout=30).close()
 
 
+def alert_embed(r, j, extra):
+    kind = f"왕복 {extra['nights']}박" if r["kind"] == "rt" else "편도"
+    desc = (f"**{r['price']:,}원** ({r['airline']}, {r['gate']})\n"
+            f"최근 {j['samples']}건 중앙값 {j['median']:,}원 대비 -{j['drop']:.0%}\n"
+            f"출발 {r['dep_at'][:16]}" + (f" / 귀국 {r['ret_at'][:16]}" if r["ret_at"] else ""))
+    if extra.get("ow_sum"):
+        desc += f"\n편도 합산 {extra['ow_sum']:,}원"
+    if extra.get("others"):
+        shown = extra["others"][:5]
+        more = len(extra["others"]) - len(shown)
+        desc += "\n다른 날짜: " + " · ".join(f"{d[5:7]}/{d[8:10]} {p:,}" for d, p in shown) + (f" 외 {more}" if more else "")
+    desc += "\n_캐시 기반 참고가입니다. 예약 전 재확인하세요._"
+    embed = {"title": f"{r['o_ap']} → {r['d_ap']} · {kind}", "description": desc}
+    if r["link"]:
+        embed["url"] = BOOK + r["link"]
+    return embed
+
+
 def notify(webhook, alerts):
-    embeds = []
-    for r, j, extra in alerts:
-        kind = f"왕복 {extra['nights']}박" if r["kind"] == "rt" else "편도"
-        desc = (f"**{r['price']:,}원** ({r['airline']}, {r['gate']})\n"
-                f"최근 {j['samples']}건 중앙값 {j['median']:,}원 대비 -{j['drop']:.0%}\n"
-                f"출발 {r['dep_at'][:16]}" + (f" / 귀국 {r['ret_at'][:16]}" if r["ret_at"] else ""))
-        if extra.get("ow_sum"):
-            desc += f"\n편도 합산 {extra['ow_sum']:,}원"
-        if extra.get("others"):
-            shown = extra["others"][:5]
-            more = len(extra["others"]) - len(shown)
-            desc += "\n다른 날짜: " + " · ".join(f"{d[5:7]}/{d[8:10]} {p:,}" for d, p in shown) + (f" 외 {more}" if more else "")
-        desc += "\n_캐시 기반 참고가입니다. 예약 전 재확인하세요._"
-        embed = {"title": f"{r['o_ap']} → {r['d_ap']} · {kind}", "description": desc}
-        if r["link"]:
-            embed["url"] = BOOK + r["link"]
-        embeds.append(embed)
+    embeds = [alert_embed(*x) for x in alerts]
     for i in range(0, len(embeds), 10):
         post(webhook, {"embeds": embeds[i:i + 10]})
 
@@ -268,22 +270,17 @@ def find_deals(rows, history, cfg, now):
 
 
 def deal_embed(g):
-    rs = g["rows"]
-    r0 = min((x["r"] for x in rs), key=lambda r: r["price"])
-    kind = "왕복" if r0["kind"] == "rt" else "편도"
-    def text(links):
-        lines = [f"{x['r']['dep_at'][:10]}" + (f" ~ {x['r']['ret_at'][:10]}" if x["r"]["ret_at"] else "")
-                 + f"  {x['r']['price']:,}원 (평소 대비 -{x['drop']:.0%})"
-                 + (f" [예약]({BOOK}{x['r']['link']})" if links and x["r"]["link"] else "")
-                 for x in sorted(rs, key=lambda x: x["r"]["dep_at"])]
-        return f"항공사 {r0['airline']}\n" + "\n".join(lines) + "\n_캐시 기반 참고가입니다. 예약 전 재확인하세요._"
-    desc = text(True)
-    if len(desc) > 4096:  # Discord embed limit: drop the per-line links, keep every date line
-        desc = text(False)
-    embed = {"title": f"🔥 특가 · {r0['o_ap']}→{r0['d_ap']} {kind} {r0['price']:,}원 (평소 대비 -{g['drop']:.0%})",
-             "description": desc, "color": 0xE67E22}
-    if r0["link"]:
-        embed["url"] = BOOK + r0["link"]
+    """Same layout as a digest alert (cheapest row as representative, other dates listed), marked as a deal."""
+    rs = sorted(g["rows"], key=lambda x: x["r"]["price"])
+    r = rs[0]["r"]
+    extra = {}
+    if r["ret_at"]:
+        extra["nights"] = (date.fromisoformat(r["ret_at"][:10]) - date.fromisoformat(r["dep_at"][:10])).days
+    if len(rs) > 1:
+        extra["others"] = [(x["r"]["dep_at"][:10], x["r"]["price"]) for x in rs[1:]]
+    embed = alert_embed(r, rs[0], extra)
+    embed["title"] = "🔥 특가 · " + embed["title"]
+    embed["color"] = 0xE67E22
     return embed
 
 
