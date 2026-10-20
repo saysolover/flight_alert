@@ -541,6 +541,38 @@ class DealSendTest(CaptureMixin, unittest.TestCase):
         self.assertEqual((done, state.get("deals_sent"), state["deals_day"]["n"]), (set(), {}, 0))
 
 
+class FoundAgeTest(unittest.TestCase):
+    def link(self, ddmmyyyy):
+        return f"/search/ICN2110FUK1?t=x&search_date={ddmmyyyy}&expected_price=1"
+
+    def test_age_kst_and_label(self):
+        now = datetime(2026, 9, 20, 16, 0, tzinfo=timezone.utc)          # 09-21 01:00 KST
+        self.assertEqual(fa.found_age({"link": self.link("21092026")}, now), 0)
+        self.assertEqual(fa.found_age({"link": self.link("20092026")}, now), 1)
+        e = fa.alert_embed(dict(row(100000), link=self.link("19092026")), {"samples": 1, "median": 1, "drop": 0.3}, {"age": 2})
+        self.assertIn("2일 전 가격", e["description"])
+        e = fa.alert_embed(row(100000), {"samples": 1, "median": 1, "drop": 0.3}, {"age": 1})
+        self.assertIn("어제 발견", e["description"])
+
+    def test_missing_or_bad_date_is_none_and_not_filtered(self):
+        for link in ("", "/search/x?t=1", "/search/x?search_date=zz"):
+            r = {"link": link}
+            self.assertIsNone(fa.found_age(r, NOW))
+            self.assertFalse(fa.too_old(r, CFG["alert"], NOW))
+
+    def test_too_old_threshold(self):
+        a = CFG["alert"]
+        self.assertFalse(fa.too_old({"link": self.link("19092026")}, a, NOW))   # 1 day (NOW=09-20 KST noon)
+        self.assertTrue(fa.too_old({"link": self.link("18092026")}, a, NOW))    # 2 days
+
+    def test_old_fare_excluded_from_pending(self):
+        old = dict(row(1000, dep="2026-11-01"), link=self.link("17092026"))
+        pend = {"k": {"r": old, "j": {}, "extra": {}, "found_at": NOW.isoformat(timespec="seconds")}}
+        self.assertEqual(fa.pending_cands(pend, {}, CFG["alert"], NOW), [])
+        pend["k"]["r"] = dict(old, link=self.link("20092026"))
+        self.assertEqual(len(fa.pending_cands(pend, {}, CFG["alert"], NOW)), 1)
+
+
 class DealEmbedTest(unittest.TestCase):
     def x(self, dep, price, link="", ret="", drop=0.55):
         r = dict(row(price, dep=dep, ret=ret + ("T19:00:00+09:00" if ret else ""), kind="rt" if ret else "ow"),

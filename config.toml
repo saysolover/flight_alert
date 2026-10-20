@@ -24,6 +24,7 @@ max_price = 0          # 0 = off
 max_alerts_per_run = 10
 digest_slots_utc = [0, 9]   # 09:00 and 18:00 KST
 digest_grace_min = 30      # collect sends a digest itself if the scheduled one is this late
+max_found_age_days = 2        # skip alerts for fares found this many days ago or more (KST); collection unaffected
 pending_hours = 48         # candidates older than this are dropped
 bucket_quota = [3, 4, 3]  # slots per bucket (len = len(buckets)+1, sum = max_alerts_per_run); unused slots spill over
 
