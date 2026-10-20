@@ -151,10 +151,12 @@ def alert_embed(r, j, extra):
         shown = extra["others"][:5]
         more = len(extra["others"]) - len(shown)
         desc += "\n다른 날짜: " + " · ".join(f"{d[5:7]}/{d[8:10]} {p:,}" for d, p in shown) + (f" 외 {more}" if more else "")
+    if extra.get("age") is not None:
+        desc += "\n" + ("오늘 발견" if extra["age"] == 0 else "어제 발견" if extra["age"] == 1 else f"{extra['age']}일 전 가격")
     desc += "\n_캐시 기반 참고가입니다. 예약 전 재확인하세요._"
     embed = {"title": f"{r['o_ap']} → {r['d_ap']} · {kind}", "description": desc}
     if r["link"]:
-        embed["url"] = BOOK + r["link"]
+        embed["url"] = BOOK + r["link"].split("?")[0] + "?currency=krw"  # route+date search, not the (possibly sold-out) cached offer
     return embed
 
 
@@ -195,12 +197,27 @@ def due_digest(state, now, a, force=False):
     return slot
 
 
+def found_age(r, now):
+    """Days (KST) since the cached fare was found, from the link's search_date=DDMMYYYY; None if absent/malformed."""
+    try:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(r["link"]).query)
+        d = datetime.strptime(q["search_date"][0], "%d%m%Y").date()
+    except (KeyError, IndexError, ValueError):
+        return None
+    return max(0, (now.astimezone(KST).date() - d).days)
+
+
+def too_old(r, a, now):
+    age = found_age(r, now)
+    return age is not None and age >= a["max_found_age_days"]
+
+
 def pending_cands(pending, alerted, a, now):
     cutoff = (now - timedelta(hours=a["pending_hours"])).isoformat(timespec="seconds")
     for k in [k for k, v in pending.items() if v["found_at"] < cutoff or v["r"]["dep_at"][:10] < now.date().isoformat()]:
         del pending[k]
     return [(v["r"], v["j"], v["extra"], k) for k, v in pending.items()
-            if v["r"]["price"] <= alerted.get(k, 1 << 60) * (1 - a["realert_drop"])]
+            if v["r"]["price"] <= alerted.get(k, 1 << 60) * (1 - a["realert_drop"]) and not too_old(v["r"], a, now)]
 
 
 def group_cands(cands, cfg, today):
@@ -230,6 +247,8 @@ def send_digest(cfg, webhook, pending, alerted, state, now, slot):
             print("DIGEST", r["o_ap"], r["d_ap"], r["dep_at"][:10], r["price"], f"-{j['drop']:.0%}", f"(+{len(members) - 1} dates)")
         return []
     try:
+        for x in sel:
+            x[2]["age"] = found_age(x[0], now)
         if sel:
             notify(webhook, [x[:3] for x in sel])
     except OSError as e:  # retried by the next collect run
@@ -256,7 +275,7 @@ def find_deals(rows, history, cfg, now):
     for r in rows:
         days = days_to_dep(r, now.date())
         k = (r["kind"], r["o_ap"], r["d_ap"])
-        if days < d["min_days"] or k not in low or r["price"] >= low[k]:
+        if days < d["min_days"] or k not in low or r["price"] >= low[k] or too_old(r, cfg["alert"], now):
             continue
         b = bucket(days, edges)
         ser = [h["price"] for h in by[k] if h["ts"] >= since
@@ -269,7 +288,7 @@ def find_deals(rows, history, cfg, now):
     return out
 
 
-def deal_embed(g):
+def deal_embed(g, now=None):
     """Same layout as a digest alert (cheapest row as representative, other dates listed), marked as a deal."""
     rs = sorted(g["rows"], key=lambda x: x["r"]["price"])
     r = rs[0]["r"]
@@ -278,6 +297,8 @@ def deal_embed(g):
         extra["nights"] = (date.fromisoformat(r["ret_at"][:10]) - date.fromisoformat(r["dep_at"][:10])).days
     if len(rs) > 1:
         extra["others"] = [(x["r"]["dep_at"][:10], x["r"]["price"]) for x in rs[1:]]
+    if now:
+        extra["age"] = found_age(r, now)
     embed = alert_embed(r, rs[0], extra)
     embed["title"] = "🔥 특가 · " + embed["title"]
     embed["color"] = 0xE67E22
@@ -307,7 +328,7 @@ def send_deals(cfg, webhook, deals, state, alerted, pending, now):
             print("DEAL", deal_embed(g)["title"])
             continue
         try:
-            post(webhook, {"embeds": [deal_embed(g)]})
+            post(webhook, {"embeds": [deal_embed(g, now)]})
         except OSError as e:  # rows stay regular pending candidates
             print("deal failed:", type(e).__name__, e)
             continue
