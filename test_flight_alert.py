@@ -557,8 +557,12 @@ class DealEmbedTest(unittest.TestCase):
         self.assertEqual(e["description"], d["description"])
         self.assertEqual(e["title"], "🔥 특가 · " + d["title"])
         self.assertEqual(e["color"], 0xE67E22)
-        self.assertEqual(e["url"], "https://www.aviasales.com/s/a")
+        self.assertEqual(e["url"], "https://www.aviasales.com/s/a?currency=krw")
         self.assertIn("중앙값 260,000원 대비 -55%", e["description"])
+
+    def test_url_drops_offer_query(self):
+        e = self.embed(self.x("2026-11-01", 116359, "/search/ICN0111KMJ1?t=abc&expected_price=1"))
+        self.assertEqual(e["url"], "https://www.aviasales.com/search/ICN0111KMJ1?currency=krw")
 
     def test_no_link_means_no_url_and_no_line_links(self):
         e = self.embed(self.x("2026-11-01", 116359))
@@ -568,7 +572,7 @@ class DealEmbedTest(unittest.TestCase):
     def test_representative_is_cheapest_and_others_listed_ascending(self):
         e = self.embed(self.x("2026-11-02", 120000, "/s/b"), self.x("2026-11-01", 116359, "/s/a"),
                        self.x("2026-11-03", 118000, "/s/c"))
-        self.assertEqual(e["url"], "https://www.aviasales.com/s/a")
+        self.assertEqual(e["url"], "https://www.aviasales.com/s/a?currency=krw")
         self.assertIn("출발 2026-11-01", e["description"])
         self.assertIn("다른 날짜: 11/03 118,000 · 11/02 120,000", e["description"])
         self.assertNotIn("[예약]", e["description"])

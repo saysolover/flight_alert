@@ -154,7 +154,7 @@ def alert_embed(r, j, extra):
     desc += "\n_캐시 기반 참고가입니다. 예약 전 재확인하세요._"
     embed = {"title": f"{r['o_ap']} → {r['d_ap']} · {kind}", "description": desc}
     if r["link"]:
-        embed["url"] = BOOK + r["link"]
+        embed["url"] = BOOK + r["link"].split("?")[0] + "?currency=krw"  # route+date search, not the (possibly sold-out) cached offer
     return embed
 
 
